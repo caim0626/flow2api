@@ -6958,11 +6958,11 @@ class BrowserCaptchaService:
 
         for cookie in browser_cookies:
             scope_host = cls._extract_cookie_scope_host(cookie)
-            explicit_domain = str(cookie.get("domain") or "").strip()
             google_family_scope = cls._is_google_family_cookie_host(scope_host)
 
-            if explicit_domain or not google_family_scope:
-                append_cookie(cookie)
+            # 带 url 的 host-only Cookie（如 flow.google.com 的 OSID）也要原样保留，
+            # 镜像列表不含 flow.google.com，漏掉会让 Flow 页面跳回登录页。
+            append_cookie(cookie)
 
             if not google_family_scope:
                 continue
@@ -7018,11 +7018,9 @@ class BrowserCaptchaService:
 
         for cookie in browser_cookies:
             scope_host = cls._extract_cookie_scope_host(cookie)
-            explicit_domain = str(cookie.get("domain") or "").strip()
             google_family_scope = cls._is_google_family_cookie_host(scope_host)
 
-            if explicit_domain or not google_family_scope:
-                append_cookie(cookie)
+            append_cookie(cookie)
 
             if not google_family_scope:
                 continue
