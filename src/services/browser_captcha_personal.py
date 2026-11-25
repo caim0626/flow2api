@@ -9948,10 +9948,14 @@ class BrowserCaptchaService:
         force_remote: bool = False,
     ) -> str:
         """直接注入远程 reCAPTCHA bootstrap 脚本。"""
-        candidate_urls = self._get_recaptcha_bootstrap_candidate_urls(
-            script_path,
-            website_key=website_key,
-        )
+        # Flow 页面强制 Trusted Types，trustedtypes=true 让 reCAPTCHA 自己的二级脚本走 TT 策略。
+        candidate_urls = [
+            f"{url}&trustedtypes=true" if "?" in url else f"{url}?trustedtypes=true"
+            for url in self._get_recaptcha_bootstrap_candidate_urls(
+                script_path,
+                website_key=website_key,
+            )
+        ]
 
         await self._tab_evaluate(
             tab,
@@ -10032,8 +10036,14 @@ class BrowserCaptchaService:
                     state.finishedAt = 0;
                     state.attempts = Number(state.attempts || 0) + 1;
                     const script = document.createElement('script');
-                    script.src = urls[index];
                     script.async = true;
+                    const nonceNode = document.querySelector('script[nonce]');
+                    const nonce = nonceNode
+                        ? (nonceNode.nonce || nonceNode.getAttribute('nonce') || '')
+                        : '';
+                    if (nonce) {{
+                        script.nonce = nonce;
+                    }}
                     let settled = false;
                     const finish = (status, error) => {{
                         if (settled) return;
@@ -10057,7 +10067,26 @@ class BrowserCaptchaService:
                         finish('error', `script load error: ${{urls[index]}}`);
                         loadScript(index + 1);
                     }};
-                    parent.appendChild(script);
+                    try {{
+                        try {{
+                            script.src = urls[index];
+                        }} catch (assignError) {{
+                            const policyKey = '__flow2apiRecaptchaScriptURLPolicy';
+                            if (!window[policyKey]) {{
+                                window[policyKey] = window.trustedTypes.createPolicy(
+                                    'flow2api-recaptcha',
+                                    {{createScriptURL: (value) => value}}
+                                );
+                            }}
+                            script.src = window[policyKey].createScriptURL(urls[index]);
+                        }}
+                        parent.appendChild(script);
+                    }} catch (error) {{
+                        clearTimeout(timer);
+                        script.remove();
+                        finish('error', error);
+                        loadScript(index + 1);
+                    }}
                 }};
                 loadScript(0);
             }})()
