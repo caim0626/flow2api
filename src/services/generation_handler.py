@@ -1707,41 +1707,96 @@ class GenerationHandler:
         risk_failures = 0
         for token_attempt in range(MAX_TOKEN_FAILOVER_ATTEMPTS):
             token = None
+            reserved_token_id: Optional[int] = None
+            pending_token_id: Optional[int] = None
             generation_result = self._create_generation_result()
             pending_token_state = {"active": False}
             if token_attempt > 0 and hasattr(
                 self.flow_client, "clear_request_fingerprint"
             ):
                 self.flow_client.clear_request_fingerprint()
-            # 选择本次尝试的 Token
+            # 选择本次尝试的 Token（带全局与单号并发槽位管理，满载时在动态队列中等待任意可用账号释放）
             debug_logger.log_info(f"[GENERATION] 正在选择可用Token...")
             token_select_started_at = time.time()
+            cm = getattr(self, "concurrency_manager", None)
+            use_slot_queue = cm is not None and hasattr(cm, "wait_for_slot_change")
+            slot_wait_timeout = max(
+                1.0,
+                float(
+                    config.flow_image_slot_wait_timeout
+                    if generation_type == "image"
+                    else config.flow_video_slot_wait_timeout
+                ),
+            )
+            slot_wait_started = time.monotonic()
+            slot_wait_deadline = slot_wait_started + slot_wait_timeout
+            slot_timed_out = False
+            queue_notice_sent = False
 
-            if generation_type == "image":
-                token = await self.load_balancer.select_token(
-                    for_image_generation=True,
+            while True:
+                slot_version = cm.slot_version if use_slot_queue else None
+                if generation_type == "image":
+                    token = await self.load_balancer.select_token(
+                        for_image_generation=True,
+                        model=model,
+                        reserve=use_slot_queue,
+                        enforce_concurrency_filter=use_slot_queue,
+                        track_pending=not use_slot_queue,
+                        exclude_token_ids=failed_token_ids,
+                    )
+                else:
+                    token = await self.load_balancer.select_token(
+                        for_video_generation=True,
+                        model=model,
+                        reserve=use_slot_queue,
+                        enforce_concurrency_filter=use_slot_queue,
+                        track_pending=not use_slot_queue,
+                        exclude_token_ids=failed_token_ids,
+                    )
+                if token is not None:
+                    if use_slot_queue:
+                        reserved_token_id = token.id
+                    else:
+                        pending_token_id = token.id
+                    break
+
+                if not use_slot_queue or not hasattr(
+                    self.load_balancer, "has_concurrency_saturated_tokens"
+                ):
+                    break
+
+                has_saturated = await self.load_balancer.has_concurrency_saturated_tokens(
+                    for_image_generation=(generation_type == "image"),
+                    for_video_generation=(generation_type == "video"),
                     model=model,
-                    reserve=False,
-                    enforce_concurrency_filter=False,
-                    track_pending=True,
                     exclude_token_ids=failed_token_ids,
                 )
-            else:
-                token = await self.load_balancer.select_token(
-                    for_video_generation=True,
-                    model=model,
-                    reserve=False,
-                    enforce_concurrency_filter=False,
-                    track_pending=True,
-                    exclude_token_ids=failed_token_ids,
-                )
+                if not has_saturated:
+                    break
+
+                remaining = slot_wait_deadline - time.monotonic()
+                if remaining <= 0:
+                    slot_timed_out = True
+                    break
+
+                if stream and not queue_notice_sent:
+                    queue_notice_sent = True
+                    yield self._create_stream_chunk(
+                        "并发已满，正在排队等待可用槽位...\n"
+                    )
+                await cm.wait_for_slot_change(remaining, since_version=slot_version)
+
+            slot_wait_ms = int((time.monotonic() - slot_wait_started) * 1000)
+            perf_trace["slot_wait_ms"] = slot_wait_ms
             perf_trace["token_select_ms"] = int(
                 (time.time() - token_select_started_at) * 1000
             )
 
             if not token:
                 error_msg = None
-                if self.load_balancer and hasattr(
+                if slot_timed_out:
+                    error_msg = f"并发槽位等待超时（已等待 {int(slot_wait_timeout)} 秒），请稍后重试"
+                if not error_msg and self.load_balancer and hasattr(
                     self.load_balancer, "get_unavailable_reason"
                 ):
                     error_msg = await self.load_balancer.get_unavailable_reason(
@@ -1777,7 +1832,8 @@ class GenerationHandler:
                 return
 
             debug_logger.log_info(f"[GENERATION] 已选择Token: {token.id} ({token.email})")
-            pending_token_state["active"] = True
+            if not use_slot_queue:
+                pending_token_state["active"] = True
             await self._update_request_log_progress(
                 request_log_state,
                 token_id=token.id,
@@ -2025,9 +2081,12 @@ class GenerationHandler:
                 error_msg = f"生成失败: {str(e)}"
                 debug_logger.log_error(f"[GENERATION] 生成失败: {error_msg}")
                 is_quota_error = self._is_quota_exhausted_error(e)
+                is_unusual_error = self._is_unusual_activity_error(e)
+                is_auth_error = self._is_auth_failure_error(e)
+                auth_handled = False
                 if (
                     token
-                    and (is_quota_error or self._is_unusual_activity_error(e))
+                    and (is_quota_error or is_unusual_error or is_auth_error)
                     # 提交结果不确定时换号可能导致重复生成
                     and not getattr(e, "submission_uncertain", False)
                     and not getattr(e, "outcome_unknown", False)
@@ -2040,6 +2099,12 @@ class GenerationHandler:
                         )
                         failover_reason = "配额耗尽"
                         failover_notice = "当前账号配额已用尽，正在切换其他账号重试...\n"
+                    elif is_auth_error:
+                        if hasattr(self.token_manager, "handle_auth_failure"):
+                            await self.token_manager.handle_auth_failure(token.id)
+                            auth_handled = True
+                        failover_reason = "登录已失效"
+                        failover_notice = "当前账号登录态已失效，正在切换其他账号重试...\n"
                     else:
                         risk_failures += 1
                         self.load_balancer.mark_risk_cooldown(token.id, scope)
@@ -2053,7 +2118,7 @@ class GenerationHandler:
                     )
                     if (
                         token_attempt < MAX_TOKEN_FAILOVER_ATTEMPTS - 1
-                        and risk_failures < MAX_RISK_FAILOVER_ATTEMPTS
+                        and (not is_unusual_error or risk_failures < MAX_RISK_FAILOVER_ATTEMPTS)
                     ):
                         debug_logger.log_warning(
                             f"[GENERATION] Token {token.id} {failover_reason}，切换账号重试 "
@@ -2067,7 +2132,7 @@ class GenerationHandler:
                             f"{error_msg}（已尝试 {len(failed_token_ids)} 个账号均失败: "
                             f"{', '.join(failover_summary)}）"
                         )
-                if token:
+                if token and not auth_handled:
                     if self._should_count_token_error(e):
                         await self.token_manager.record_error(token.id)
                     else:
@@ -2099,9 +2164,15 @@ class GenerationHandler:
                     yield self._create_stream_chunk(f"错误: {error_msg}\n")
                 yield self._create_error_response(error_msg, status_code=500)
             finally:
-                if pending_token_state.get("active") and token and self.load_balancer:
+                if reserved_token_id is not None and cm is not None:
+                    if generation_type == "image":
+                        await cm.release_image(reserved_token_id)
+                    elif generation_type == "video":
+                        await cm.release_video(reserved_token_id)
+                    reserved_token_id = None
+                if pending_token_state.get("active") and pending_token_id is not None and self.load_balancer:
                     await self.load_balancer.release_pending(
-                        token.id,
+                        pending_token_id,
                         for_image_generation=(generation_type == "image"),
                         for_video_generation=(generation_type == "video"),
                     )
@@ -2143,11 +2214,17 @@ class GenerationHandler:
         """账号/IP 被风控拒绝：提交被拒、未创建任务，换一个账号通常可以成功。"""
         return "public_error_unusual_activity" in str(error or "").lower()
 
+    @staticmethod
+    def _is_auth_failure_error(error: Exception) -> bool:
+        """账号 Google Cookie 失效/401 拒绝：尚未提交生成，可停用失效号并切到其他健康账号。"""
+        text = str(error or "").lower()
+        return "flow 登录认证失败" in text or "code=401" in text
+
     def _should_count_token_error(self, error: Exception) -> bool:
         """判断失败是否应计入 token 连续错误。
 
-        reCAPTCHA 获取失败、验证码供应商错误、打码资源不足等问题通常不是账号本身异常；
-        若将其纳入连续错误，会在回归测试或代理波动时把 token 自动打成 inactive。
+        reCAPTCHA 获取失败、内容安全审核拒图、验证码供应商错误、排队超时等问题不是账号本身异常；
+        若将其纳入连续错误，会在上传敏感参考图或并发排队时把健康 token 误打成 inactive。
         """
         error_text = str(error or "").strip().lower()
         if not error_text:
@@ -2160,6 +2237,21 @@ class GenerationHandler:
             "recaptcha 错误",
             "public_error_unusual_activity",
             "public_error_user_quota_reached",
+            "public_error_sexual_upload",
+            "public_error_unsafe_generation",
+            "public_error_prominent_people_filter_failed",
+            "public_error_minor_upload",
+            "public_error_violence",
+            "public_error_harassment",
+            "public_error_hate_speech",
+            "public_error_dangerous",
+            "public_error_policy_violation",
+            "public_error_celebrity",
+            "public_error_csam",
+            "内容安全过滤",
+            "人物安全过滤",
+            "browser captcha queue wait timeout",
+            "并发槽位等待超时",
             "too much traffic",
             "error_no_slot_available",
             "打码服务资源不足",
@@ -2209,7 +2301,7 @@ class GenerationHandler:
         normalized_tier = normalize_user_paygate_tier(token.user_paygate_tier)
 
         if image_trace is not None:
-            image_trace["slot_wait_ms"] = 0
+            image_trace["slot_wait_ms"] = int(perf_trace.get("slot_wait_ms", 0))
 
         if images and len(images) > 0:
             await self._update_request_log_progress(
@@ -2630,7 +2722,7 @@ class GenerationHandler:
         normalized_tier = normalize_user_paygate_tier(token.user_paygate_tier)
 
         if video_trace is not None:
-            video_trace["slot_wait_ms"] = 0
+            video_trace["slot_wait_ms"] = int(perf_trace.get("slot_wait_ms", 0))
 
         await self._update_request_log_progress(
             request_log_state,

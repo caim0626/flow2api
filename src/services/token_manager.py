@@ -1190,6 +1190,40 @@ class TokenManager:
             debug_logger.log_warning(f"[COOKIE_REFRESH] Token {token_id}: 浏览器刷新失败 - {error}")
             return None
 
+    async def handle_auth_failure(self, token_id: int) -> bool:
+        """处理上游 RPC 401 认证失败：清缓存、尝试快速刷新 Cookie，若已彻底失效则停用账号。
+
+        Returns:
+            True if cookies were successfully refreshed; False if token remains invalid/disabled.
+        """
+        self._clear_at_validation_cache(token_id)
+        refresh_lock = await self._get_token_lock(
+            self._refresh_locks, self._refresh_lock_guard, token_id
+        )
+        async with refresh_lock:
+            token = await self.db.get_token(token_id)
+            if not token or not token.is_active:
+                return False
+            if (token.google_cookies or "").strip():
+                refreshed = await self._try_protocol_refresh_st(token_id, token)
+                if refreshed:
+                    return True
+                latest = await self.db.get_token(token_id)
+                failure_reason = str(
+                    getattr(latest, "last_st_refresh_result", "") or ""
+                )
+                if self._all_refresh_failures_transient([failure_reason]):
+                    debug_logger.log_warning(
+                        f"[AUTH_FAILURE] Token {token_id}: 401 后协议刷新遇瞬时网络错误，暂不停用 - {failure_reason}"
+                    )
+                    return False
+            debug_logger.log_error(
+                f"[AUTH_FAILURE] Token {token_id}: 上游返回 401 且 Cookie 无法续期，自动停用账号"
+            )
+            await self.disable_token(token_id)
+            self._clear_at_validation_cache(token_id)
+            return False
+
     async def refresh_cookies(self, token_id: int) -> bool:
         """Explicitly renew current-Flow Cookies even when the AT marker is valid."""
         refresh_lock = await self._get_token_lock(

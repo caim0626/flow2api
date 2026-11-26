@@ -543,7 +543,9 @@ async def render_main_metrics(
     return generate_latest(MAIN_REGISTRY)
 
 
-async def build_public_health_snapshot(db: Any) -> dict[str, Any]:
+async def build_public_health_snapshot(
+    db: Any, concurrency_manager: Optional[Any] = None
+) -> dict[str, Any]:
     rows = await db.get_all_tokens_with_stats()
     now = datetime.now(timezone.utc)
 
@@ -571,6 +573,11 @@ async def build_public_health_snapshot(db: Any) -> dict[str, Any]:
         ).strip() == "429_rate_limit":
             banned_429_tokens += 1
 
+    concurrency_summary = (
+        concurrency_manager.get_summary()
+        if concurrency_manager is not None and hasattr(concurrency_manager, "get_summary")
+        else {}
+    )
     return {
         "backend_running": True,
         "has_active_tokens": active_tokens > 0,
@@ -581,6 +588,11 @@ async def build_public_health_snapshot(db: Any) -> dict[str, Any]:
         "tokens_expiring_within_1h": expiring_soon_tokens,
         "banned_429_tokens": banned_429_tokens,
         "captcha_method": config.captcha_method,
+        "browser_count": config.browser_count,
+        "max_image_concurrency": concurrency_summary.get("max_image_concurrency"),
+        "max_video_concurrency": concurrency_summary.get("max_video_concurrency"),
+        "image_inflight": concurrency_summary.get("image_inflight", 0),
+        "video_inflight": concurrency_summary.get("video_inflight", 0),
         "remote_browser_configured": (
             config.captcha_method == "remote_browser"
             and bool((config.remote_browser_base_url or "").strip())

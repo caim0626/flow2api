@@ -1389,6 +1389,26 @@ class TokenBrowser:
             except Exception:
                 await route.continue_()
 
+        async def _abort_rotate_cookies(route):
+            try:
+                await route.abort()
+            except Exception:
+                pass
+
+        try:
+            # 阻止 Flow 顶栏 gbar_ 嵌入的 accounts.google.com/RotateCookiesPage
+            # 在 600s 周期静默轮换 __Secure-*PSIDTS。浏览器轮换后的 Cookie 不会回写
+            # 数据库，紧接着 curl_cffi 仍发旧 PSIDTS 会触发 Google 401 并吊销整段登录态。
+            await page.route(
+                re.compile(r"^https://accounts\.google\.com/RotateCookies", re.IGNORECASE),
+                _abort_rotate_cookies,
+            )
+        except Exception as route_error:
+            debug_logger.log_warning(
+                f"[BrowserCaptcha] Token-{self.token_id} RotateCookies 拦截注册失败: "
+                f"{type(route_error).__name__}: {str(route_error)[:150]}"
+            )
+
         try:
             await page.route(
                 # 注意：Playwright glob 中单个 * 不跨越路径分隔符，
@@ -1580,7 +1600,7 @@ class TokenBrowser:
             browser_args = [
                 "--disable-blink-features=AutomationControlled",
                 "--disable-quic",
-                "--disable-features=UseDnsHttpsSvcb",
+                "--disable-features=UseDnsHttpsSvcb,EnableBoundSessionCredentials,DeviceBoundSessions",
                 "--lang=en-US",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
@@ -3992,17 +4012,39 @@ class BrowserCaptchaService:
             )
         return None
     
+    def _resolve_queue_wait_seconds(self, action: Optional[str] = None) -> float:
+        """Resolve how long a captcha request may wait for an idle browser slot."""
+        normalized_action = str(action or "").strip().upper()
+        configured = (
+            getattr(config, "flow_video_slot_wait_timeout", None)
+            if "VIDEO" in normalized_action
+            else getattr(config, "flow_image_slot_wait_timeout", None)
+        )
+        try:
+            configured_wait = float(configured or 0)
+        except (TypeError, ValueError):
+            configured_wait = 0.0
+        return max(float(self.QUEUE_WAIT_SECONDS), configured_wait)
+
     async def get_token(
         self,
         project_id: str,
         action: str = "IMAGE_GENERATION",
         token_id: int = None,
+        wait_timeout: Optional[float] = None,
     ) -> tuple[Optional[str], Union[int, str], Optional[Dict[str, Any]]]:
         """Reserve the account context until its protected submission completes."""
         self._check_available()
         self._stats["req_total"] += 1
         token_proxy_url = await self._resolve_token_proxy_url(token_id)
-        async with self._borrow_browser(project_id, token_id) as request:
+        effective_wait = (
+            self._resolve_queue_wait_seconds(action)
+            if wait_timeout is None
+            else max(0.0, float(wait_timeout))
+        )
+        async with self._borrow_browser(
+            project_id, token_id, wait_timeout=effective_wait
+        ) as request:
             token, session_id = await asyncio.wait_for(
                 request.browser.get_token(
                     project_id,

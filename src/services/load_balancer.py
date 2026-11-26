@@ -523,3 +523,45 @@ class LoadBalancer:
                 return "当前有符合档位的账号，但视频生成功能已全部禁用。"
 
         return None
+
+    async def has_concurrency_saturated_tokens(
+        self,
+        *,
+        for_image_generation: bool = False,
+        for_video_generation: bool = False,
+        model: Optional[str] = None,
+        exclude_token_ids: Optional[Iterable[int]] = None,
+    ) -> bool:
+        """Return True if at least one eligible active token exists but is currently at concurrency capacity."""
+        if not self.concurrency_manager:
+            return False
+
+        active_tokens = await self.token_manager.get_active_tokens()
+        if not active_tokens:
+            return False
+
+        excluded = set(exclude_token_ids or ())
+        for token in active_tokens:
+            if token.id in excluded:
+                continue
+            normalized_tier = normalize_user_paygate_tier(token.user_paygate_tier)
+            if model and not supports_model_for_tier(model, normalized_tier):
+                continue
+            if for_image_generation:
+                if not token.image_enabled:
+                    continue
+                route_ok, _ = await self._check_extension_route(token)
+                if not route_ok:
+                    continue
+                if not await self.concurrency_manager.can_use_image(token.id):
+                    return True
+            if for_video_generation:
+                if not token.video_enabled:
+                    continue
+                route_ok, _ = await self._check_extension_route(token)
+                if not route_ok:
+                    continue
+                if not await self.concurrency_manager.can_use_video(token.id):
+                    return True
+
+        return False

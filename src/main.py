@@ -188,6 +188,10 @@ async def lifespan(app: FastAPI):
 
     # Initialize concurrency manager
     await concurrency_manager.initialize(tokens)
+    img_cap, vid_cap = config.resolve_effective_global_concurrency()
+    await concurrency_manager.set_global_limits(
+        image_limit=img_cap, video_limit=vid_cap
+    )
 
     if config.captcha_method == "remote_browser":
         try:

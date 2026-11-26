@@ -256,6 +256,63 @@ class Config:
         except Exception:
             return 0
 
+    @staticmethod
+    def _read_env_nonneg_int(*env_names: str) -> Optional[int]:
+        for name in env_names:
+            raw = os.getenv(name)
+            if raw is None or not str(raw).strip():
+                continue
+            try:
+                return max(0, min(200, int(str(raw).strip())))
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    @property
+    def flow_max_image_concurrency(self) -> int:
+        """全局图片最大并发数（0 表示不额外限制；browser 模式在运行时默认与 browser_count 对齐）。"""
+        env_value = self._read_env_nonneg_int(
+            "FLOW2API_MAX_IMAGE_CONCURRENCY",
+            "FLOW2API_MAX_CONCURRENCY",
+        )
+        if env_value is not None:
+            return env_value
+        value = self._config.get("flow", {}).get("max_image_concurrency", 0)
+        try:
+            return max(0, min(200, int(value or 0)))
+        except Exception:
+            return 0
+
+    @property
+    def flow_max_video_concurrency(self) -> int:
+        """全局视频最大并发数（0 表示不额外限制；browser 模式在运行时默认与 browser_count 对齐）。"""
+        env_value = self._read_env_nonneg_int(
+            "FLOW2API_MAX_VIDEO_CONCURRENCY",
+            "FLOW2API_MAX_CONCURRENCY",
+        )
+        if env_value is not None:
+            return env_value
+        value = self._config.get("flow", {}).get("max_video_concurrency", 0)
+        try:
+            return max(0, min(200, int(value or 0)))
+        except Exception:
+            return 0
+
+    def resolve_effective_global_concurrency(self) -> tuple[Optional[int], Optional[int]]:
+        """返回生效的全局图片/视频并发上限（None 表示不限制）。"""
+        image_limit = self.flow_max_image_concurrency
+        video_limit = self.flow_max_video_concurrency
+        if self.captcha_method == "browser":
+            browser_cap = max(1, int(self.browser_count or 1))
+            if image_limit <= 0:
+                image_limit = browser_cap
+            if video_limit <= 0:
+                video_limit = browser_cap
+        return (
+            image_limit if image_limit > 0 else None,
+            video_limit if video_limit > 0 else None,
+        )
+
     @property
     def poll_interval(self) -> float:
         return self._config["flow"]["poll_interval"]

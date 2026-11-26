@@ -1716,7 +1716,9 @@ async def logout(response: Response, token: str = Depends(verify_admin_token)):
 async def health_check():
     """Public health check endpoint - no auth required"""
     try:
-        return await build_public_health_snapshot(db)
+        return await build_public_health_snapshot(
+            db, concurrency_manager=concurrency_manager
+        )
     except Exception:
         return {"backend_running": True, "has_active_tokens": False}
 
@@ -2151,6 +2153,11 @@ async def update_captcha_config(
 
     # 🔥 Hot reload: sync database config to memory
     await db.reload_config_to_memory()
+    if concurrency_manager and hasattr(concurrency_manager, "set_global_limits"):
+        img_cap, vid_cap = config.resolve_effective_global_concurrency()
+        await concurrency_manager.set_global_limits(
+            image_limit=img_cap, video_limit=vid_cap
+        )
 
     runtime_prepare_started = False
     runtime_prepare_message = ""
